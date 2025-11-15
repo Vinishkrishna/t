@@ -1,0 +1,96 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Translation Management Tool</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+  <div class="container">
+    <header class="top">
+      <div>
+        <h1>TMT — Translation Management Tool</h1>
+        <p class="muted">Add keys, auto-translate (HuggingFace NLLB), edit & export. Fast & production-ready.</p>
+      </div>
+      <div class="top-actions">
+        <button id="exportBtn" class="btn btn-ghost">Export JSON</button>
+      </div>
+    </header>
+
+    <main class="card">
+      <nav class="tabs">
+        <button class="tab active" data-tab="add">Add</button>
+        <button class="tab" data-tab="manage">Manage</button>
+        <button class="tab" data-tab="languages">Languages</button>
+      </nav>
+
+      <section id="tab-add" class="tab-panel active">
+        <div class="form-grid">
+          <div>
+            <label>Key <small class="muted">e.g. HOME_TITLE</small></label>
+            <input id="translationKey" placeholder="HOME_TITLE">
+          </div>
+
+          <div>
+            <label>English value</label>
+            <textarea id="englishValue" placeholder="Welcome to Dashboard"></textarea>
+          </div>
+
+          <div>
+            <label>Languages to auto-generate</label>
+            <div class="dropdown-container">
+              <div id="langDropdown" class="dropdown-header">Select languages ▼</div>
+              <div id="langDropdownMenu" class="dropdown-menu"></div>
+            </div>
+            <small class="muted">Select languages. If none selected, all non-English languages will be used.</small>
+          </div>
+
+          <div class="actions">
+            <button id="generateBtn" class="btn btn-primary">Generate & Save</button>
+            <button id="clearBtn" class="btn btn-secondary">Clear</button>
+          </div>
+        </div>
+
+        <div id="generatedArea" class="mt-16"></div>
+      </section>
+
+      <section id="tab-manage" class="tab-panel">
+        <div class="toolbar">
+          <input id="searchInput" placeholder="Search by key or text">
+          <div>
+            <select id="sortBy"><option value="key">Key</option><option value="created_at">Created</option></select>
+            <select id="orderBy"><option value="asc">Asc</option><option value="desc">Desc</option></select>
+            <button id="searchBtn" class="btn">Search</button>
+          </div>
+        </div>
+
+        <div id="translationsList" class="list mt-12"></div>
+        <div id="pagination" class="mt-8"></div>
+      </section>
+
+      <section id="tab-languages" class="tab-panel">
+        <div class="lang-grid">
+          <div>
+            <label>Existing languages</label>
+            <div id="languagesList" class="language-list"></div>
+          </div>
+          <div>
+            <label>Add a language</label>
+            <input id="languageCode" placeholder="e.g. de or pt">
+            <input id="languageName" placeholder="Language name e.g. German">
+            <button id="addLanguageBtn" class="btn btn-primary">Add Language</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot muted">Built with Flask • HuggingFace • MongoDB · TMT</footer>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/static/js/main.js"></script>
+</body>
+</html>
