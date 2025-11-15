@@ -1,344 +1,592 @@
 # app.py
 """
-Translation Management Tool (TMT) - Backend
+Translation Management Tool (TMT) - Production-Ready Backend
 Features:
-- Flask REST API + server-rendered index
+- Flask REST API with server-rendered UI
 - MongoDB (Atlas or local) for persistence
-- HuggingFace Inference API (NLLB model) for fast, high-quality translations
-- Languages management (add language, auto-fill existing keys)
+- Google Translate API via Node.js microservice
+- Language management with standard language presets
 - Add/Search/Edit/Delete translations
 - Regenerate translations
 - Export translations JSON
-- Small in-memory cache for repeated translations
-- SSE endpoint (basic) for live notifications
+- Real-time SSE notifications
+- Production-grade error handling and logging
 """
 
 import os
 import json
 import time
 import threading
-from datetime import datetime, timedelta
-from functools import lru_cache
-from typing import Dict
+import logging
+from datetime import datetime
+from typing import Dict, List
+from functools import wraps
 
 from flask import Flask, render_template, request, jsonify, Response, send_file
 from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import PyMongoError
 from bson import ObjectId
 from dotenv import load_dotenv
 import requests
 import tempfile
 
 # ---------------------------
-# Load env and config
+# Logging Configuration
+# ---------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------
+# Load environment variables
 # ---------------------------
 load_dotenv()
 
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
-    raise RuntimeError("MONGO_URI is required in .env")
+    raise RuntimeError("MONGO_URI is required in .env file")
 
 DB_NAME = os.getenv("MONGO_DB", "translation")
-HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")  # required
-HF_MODEL_ID = os.getenv("HF_MODEL_ID", "facebook/nllb-200-distilled-600M")
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
+TRANSLATION_SERVICE_URL = os.getenv("TRANSLATION_SERVICE_URL", "http://localhost:4000")
 
-# Basic app settings
+# App settings
 PORT = int(os.getenv("PORT", "5000"))
 DEBUG = os.getenv("FLASK_DEBUG", "False").lower() in ("1", "true", "yes")
 
 # ---------------------------
-# Flask + DB init
+# Flask + MongoDB Initialization
 # ---------------------------
 app = Flask(__name__, static_folder="static", template_folder="templates")
 CORS(app)
 
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
-translations_col = db["translations"]
-languages_col = db["languages"]
+# MongoDB connection with error handling
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')
+    db = client[DB_NAME]
+    translations_col = db["translations"]
+    languages_col = db["languages"]
+    logger.info("MongoDB connection established successfully")
+except PyMongoError as e:
+    logger.error(f"MongoDB connection failed: {e}")
+    raise
 
-# SSE (in-memory events)
+# Create indexes for better performance
+try:
+    translations_col.create_index([("key", ASCENDING)], unique=True)
+    translations_col.create_index([("created_at", DESCENDING)])
+    languages_col.create_index([("code", ASCENDING)], unique=True)
+    logger.info("Database indexes created successfully")
+except Exception as e:
+    logger.warning(f"Index creation warning: {e}")
+
+# ---------------------------
+# SSE Event Management
+# ---------------------------
 SSE_EVENTS = []
 SSE_LOCK = threading.Lock()
-def push_event(e: Dict):
+MAX_EVENTS = 300
+
+def push_event(event: Dict):
+    """Push event to SSE stream"""
     with SSE_LOCK:
-        SSE_EVENTS.append({"ts": time.time(), **e})
-        if len(SSE_EVENTS) > 300:
+        SSE_EVENTS.append({"ts": time.time(), **event})
+        if len(SSE_EVENTS) > MAX_EVENTS:
             SSE_EVENTS.pop(0)
+    logger.info(f"Event pushed: {event.get('type')}")
 
 # ---------------------------
-# NLLB code mapping
+# Standard Language Presets
 # ---------------------------
-# Minimal mapping for common languages. Expand as needed.
-NLLB_CODES = {
-    "en": "eng_Latn",
-    "es": "spa_Latn",
-    "fr": "fra_Latn",
-    "de": "deu_Latn",
-    "hi": "hin_Deva",
-    "ta": "tam_Taml",
-    "te": "tel_Telu",
-    "zh": "zho_Hans",
-    "ar": "arb_Arab",
-    "it": "ita_Latn",
-    "pt": "por_Latn",
-    "bn": "ben_Beng",
-    "mr": "mar_Deva",
-    "pa": "pan_Guru",
-    "gu": "guj_Gujr",
-    "kn": "kan_Knda",
-    "ml": "mal_Taml",
-    "ur": "urd_Arab"
-}
-
-# ---------------------------
-# Simple in-memory cache
-# ---------------------------
-# A tiny TTL cache to avoid repeated HF calls when same text-language pair occurs.
-class TTLCache:
-    def __init__(self, ttl_seconds=3600):
-        self.ttl = ttl_seconds
-        self._data = {}
-        self._lock = threading.Lock()
-
-    def get(self, key):
-        with self._lock:
-            entry = self._data.get(key)
-            if not entry:
-                return None
-            val, ts = entry
-            if time.time() - ts > self.ttl:
-                del self._data[key]
-                return None
-            return val
-
-    def set(self, key, value):
-        with self._lock:
-            self._data[key] = (value, time.time())
-
-cache = TTLCache(ttl_seconds=60*60)  # 1 hour cache
+STANDARD_LANGUAGES = [
+    {"code": "en", "name": "English"},
+    {"code": "es", "name": "Spanish"},
+    {"code": "fr", "name": "French"},
+    {"code": "de", "name": "German"},
+    {"code": "it", "name": "Italian"},
+    {"code": "pt", "name": "Portuguese"},
+    {"code": "ru", "name": "Russian"},
+    {"code": "ja", "name": "Japanese"},
+    {"code": "ko", "name": "Korean"},
+    {"code": "zh-CN", "name": "Chinese (Simplified)"},
+    {"code": "zh-TW", "name": "Chinese (Traditional)"},
+    {"code": "ar", "name": "Arabic"},
+    {"code": "hi", "name": "Hindi"},
+    {"code": "bn", "name": "Bengali"},
+    {"code": "ta", "name": "Tamil"},
+    {"code": "te", "name": "Telugu"},
+    {"code": "mr", "name": "Marathi"},
+    {"code": "ur", "name": "Urdu"},
+    {"code": "tr", "name": "Turkish"},
+    {"code": "vi", "name": "Vietnamese"},
+    {"code": "th", "name": "Thai"},
+    {"code": "nl", "name": "Dutch"},
+    {"code": "pl", "name": "Polish"},
+    {"code": "sv", "name": "Swedish"},
+    {"code": "no", "name": "Norwegian"},
+    {"code": "da", "name": "Danish"},
+    {"code": "fi", "name": "Finnish"}
+]
 
 # ---------------------------
-# Helper: call HuggingFace Inference API
+# Translation Service Integration
 # ---------------------------
-HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
-
-def hf_translate(text, target_code, target_name):
-    MODEL = "Helsinki-NLP/opus-mt-en-ROMANCE"
-
-    HF_URL = f"https://api-inference.huggingface.co/models/{MODEL}"
-    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-
-    payload = {
-        "inputs": text,
-        "parameters": {
-            "src_lang": "eng_Latn",
-            "tgt_lang": NLLB_CODES[target_code],
-            "max_length": 300
-        }
-    }
-
-
+def call_translation_service(text: str, target_languages: List[str]) -> Dict:
+    """Call Node.js translation microservice"""
     try:
-        resp = requests.post(HF_URL, headers=headers, json=payload, timeout=15)
-
-        if resp.status_code == 200:
-            out = resp.json()
-            if isinstance(out, list) and "translation_text" in out[0]:
-                return out[0]["translation_text"]
-            elif isinstance(out, dict) and "translation_text" in out:
-                return out["translation_text"]
-
-        print("HF ERROR:", resp.text)
-        return f"[{target_code}] {text}"
-
+        response = requests.post(
+            f"{TRANSLATION_SERVICE_URL}/translate",
+            json={"text": text, "languages": target_languages},
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("success"):
+            return {"success": True, "translations": data.get("translations", {})}
+        else:
+            return {"success": False, "error": data.get("error", "Translation service error")}
+    
+    except requests.exceptions.ConnectionError:
+        logger.error("Translation service not available")
+        return {"success": False, "error": "Translation service unavailable"}
+    except requests.exceptions.Timeout:
+        logger.error("Translation service timeout")
+        return {"success": False, "error": "Translation service timeout"}
     except Exception as e:
-        print("HF EXCEPTION:", e)
-        return f"[{target_code}] {text}"
+        logger.error(f"Translation service error: {e}")
+        return {"success": False, "error": str(e)}
 
 # ---------------------------
-# Initialize default languages
+# Initialize Default Languages
 # ---------------------------
-def init_default_langs():
-    if languages_col.count_documents({}) == 0:
-        languages_col.insert_many([
-            {"code": "en", "name": "English", "is_default": True},
-            {"code": "es", "name": "Spanish", "is_default": False},
-            {"code": "fr", "name": "French", "is_default": False}
-        ])
-init_default_langs()
+def init_default_languages():
+    """Initialize database with default languages"""
+    try:
+        if languages_col.count_documents({}) == 0:
+            default_langs = [
+                {"code": "en", "name": "English", "is_default": True},
+                {"code": "es", "name": "Spanish", "is_default": False},
+                {"code": "fr", "name": "French", "is_default": False}
+            ]
+            languages_col.insert_many(default_langs)
+            logger.info("Default languages initialized")
+    except Exception as e:
+        logger.error(f"Error initializing languages: {e}")
+
+init_default_languages()
 
 # ---------------------------
-# Serialization helper
+# Utility Functions
 # ---------------------------
-def serialize_doc(d):
-    doc = dict(d)
-    doc["_id"] = str(doc["_id"])
-    return doc
+def serialize_doc(doc):
+    """Convert MongoDB document to JSON-serializable format"""
+    if doc is None:
+        return None
+    doc_copy = dict(doc)
+    doc_copy["_id"] = str(doc_copy["_id"])
+    if "created_at" in doc_copy:
+        doc_copy["created_at"] = doc_copy["created_at"].isoformat()
+    if "updated_at" in doc_copy:
+        doc_copy["updated_at"] = doc_copy["updated_at"].isoformat()
+    return doc_copy
+
+def error_response(message: str, status_code: int = 400):
+    """Standard error response"""
+    return jsonify({"success": False, "error": message}), status_code
+
+def success_response(data: Dict = None, message: str = None):
+    """Standard success response"""
+    response = {"success": True}
+    if data:
+        response.update(data)
+    if message:
+        response["message"] = message
+    return jsonify(response)
+
+# ---------------------------
+# Error Handlers
+# ---------------------------
+@app.errorhandler(404)
+def not_found(e):
+    return error_response("Resource not found", 404)
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal error: {e}")
+    return error_response("Internal server error", 500)
 
 # ---------------------------
 # Routes: UI
 # ---------------------------
 @app.route("/")
 def index():
-    langs = list(languages_col.find({}, {"_id": 0}))
-    return render_template("index.html", languages=langs)
+    """Render main application page"""
+    try:
+        langs = list(languages_col.find({}, {"_id": 0}))
+        return render_template("index.html", languages=langs, standard_languages=STANDARD_LANGUAGES)
+    except Exception as e:
+        logger.error(f"Error rendering index: {e}")
+        return "Application error", 500
 
 # ---------------------------
-# SSE (basic) - client can connect to receive events
+# SSE Stream
 # ---------------------------
 @app.route("/stream")
 def stream():
-    def gen(last_index=0):
-        idx = last_index
+    """Server-Sent Events endpoint for real-time updates"""
+    def event_generator():
+        last_index = 0
         while True:
             with SSE_LOCK:
                 events = SSE_EVENTS[:]
-            if idx < len(events):
-                for ev in events[idx:]:
-                    yield f"data: {json.dumps(ev)}\n\n"
-                idx = len(events)
+            
+            if last_index < len(events):
+                for event in events[last_index:]:
+                    yield f"data: {json.dumps(event)}\n\n"
+                last_index = len(events)
+            
             time.sleep(1)
-    return Response(gen(), mimetype="text/event-stream")
+    
+    return Response(event_generator(), mimetype="text/event-stream")
 
 # ---------------------------
 # Languages API
 # ---------------------------
 @app.route("/api/languages", methods=["GET"])
 def api_get_languages():
-    langs = list(languages_col.find({}, {"_id": 0}))
-    return jsonify({"success": True, "languages": langs})
+    """Get all configured languages"""
+    try:
+        langs = list(languages_col.find({}, {"_id": 0}))
+        return success_response({"languages": langs})
+    except Exception as e:
+        logger.error(f"Error fetching languages: {e}")
+        return error_response("Failed to fetch languages", 500)
+
+@app.route("/api/languages/standard", methods=["GET"])
+def api_get_standard_languages():
+    """Get list of standard language presets"""
+    return success_response({"languages": STANDARD_LANGUAGES})
 
 @app.route("/api/languages", methods=["POST"])
 def api_add_language():
-    body = request.get_json() or {}
-    code = (body.get("code") or "").strip().lower()
-    name = (body.get("name") or "").strip()
+    """Add a new language"""
+    try:
+        body = request.get_json() or {}
+        code = (body.get("code") or "").strip().lower()
+        name = (body.get("name") or "").strip()
 
-    if not code or not name:
-        return jsonify({"success": False, "error": "code & name required"}), 400
-    if languages_col.find_one({"code": code}):
-        return jsonify({"success": False, "error": "language exists"}), 400
+        if not code or not name:
+            return error_response("Language code and name are required")
 
-    languages_col.insert_one({"code": code, "name": name, "is_default": False})
+        # Check if language already exists
+        if languages_col.find_one({"code": code}):
+            return error_response("Language already exists")
 
-    # Auto fill existing keys with translated values (best-effort)
-    for t in translations_col.find({}):
-        en = (t.get("values") or {}).get("en", "")
-        translated = hf_translate(en, code, name)
-        translations_col.update_one({"_id": t["_id"]}, {"$set": {f"values.{code}": translated, "updated_at": datetime.utcnow()}})
+        # Insert new language
+        languages_col.insert_one({
+            "code": code,
+            "name": name,
+            "is_default": False
+        })
 
-    push_event({"type": "language_added", "code": code, "name": name})
-    return jsonify({"success": True, "code": code, "name": name})
+        # Auto-translate existing keys to new language
+        existing_count = 0
+        for translation in translations_col.find({}):
+            en_value = (translation.get("values") or {}).get("en", "")
+            if en_value:
+                result = call_translation_service(en_value, [code])
+                if result.get("success"):
+                    translations = result.get("translations", {})
+                    new_value = translations.get(code, f"[{code}] {en_value}")
+                    translations_col.update_one(
+                        {"_id": translation["_id"]},
+                        {
+                            "$set": {
+                                f"values.{code}": new_value,
+                                "updated_at": datetime.utcnow()
+                            }
+                        }
+                    )
+                    existing_count += 1
+
+        push_event({
+            "type": "language_added",
+            "code": code,
+            "name": name,
+            "translations_updated": existing_count
+        })
+
+        logger.info(f"Language added: {code} ({name}), {existing_count} translations updated")
+        return success_response({
+            "code": code,
+            "name": name,
+            "translations_updated": existing_count
+        })
+
+    except Exception as e:
+        logger.error(f"Error adding language: {e}")
+        return error_response("Failed to add language", 500)
 
 # ---------------------------
 # Translations CRUD
 # ---------------------------
-
 @app.route("/api/translations", methods=["GET"])
 def api_list_translations():
-    q = request.args.get("q", "").strip()
-    page = int(request.args.get("page", "1"))
-    per = int(request.args.get("per", "20"))
-    sort_by = request.args.get("sort", "key")
-    order = request.args.get("order", "asc")
+    """List translations with search, pagination and sorting"""
+    try:
+        query_text = request.args.get("q", "").strip()
+        page = max(1, int(request.args.get("page", "1")))
+        per_page = max(1, min(100, int(request.args.get("per", "20"))))
+        sort_by = request.args.get("sort", "key")
+        order = request.args.get("order", "asc")
 
-    query = {}
-    if q:
-        query = {"$or": [{"key": {"$regex": q, "$options": "i"}}, {"values": {"$regex": q, "$options": "i"}}]}
+        # Build query
+        query = {}
+        if query_text:
+            query = {
+                "$or": [
+                    {"key": {"$regex": query_text, "$options": "i"}},
+                    {"values": {"$regex": query_text, "$options": "i"}}
+                ]
+            }
 
-    sort_dir = ASCENDING if order == "asc" else DESCENDING
-    cursor = translations_col.find(query).sort(sort_by, sort_dir).skip((page-1)*per).limit(per)
-    total = translations_col.count_documents(query)
-    docs = [serialize_doc(d) for d in cursor]
-    return jsonify({"success": True, "translations": docs, "page": page, "per": per, "total": total})
+        # Sort direction
+        sort_dir = ASCENDING if order == "asc" else DESCENDING
+
+        # Execute query
+        cursor = translations_col.find(query).sort(sort_by, sort_dir).skip((page - 1) * per_page).limit(per_page)
+        total = translations_col.count_documents(query)
+        docs = [serialize_doc(d) for d in cursor]
+
+        return success_response({
+            "translations": docs,
+            "page": page,
+            "per": per_page,
+            "total": total,
+            "pages": (total + per_page - 1) // per_page
+        })
+
+    except Exception as e:
+        logger.error(f"Error listing translations: {e}")
+        return error_response("Failed to fetch translations", 500)
 
 @app.route("/api/translations", methods=["POST"])
 def api_add_translation():
-    body = request.get_json() or {}
-    key_raw = (body.get("key") or "").strip()
-    en_value = (body.get("value") or "").strip()
-    if not key_raw or not en_value:
-        return jsonify({"success": False, "error": "key & english value required"}), 400
+    """Add new translation with auto-generation"""
+    try:
+        body = request.get_json() or {}
+        key_raw = (body.get("key") or "").strip()
+        en_value = (body.get("value") or "").strip()
+        target_languages = body.get("languages", [])
 
-    key = key_raw.upper().replace(" ", "_")
-    if translations_col.find_one({"key": key}):
-        return jsonify({"success": False, "error": "key exists"}), 400
+        if not key_raw or not en_value:
+            return error_response("Translation key and English value are required")
 
-    values = {"en": en_value}
-    languages = list(languages_col.find({}, {"_id": 0}))
-    for lang in languages:
-        code = lang["code"]
-        name = lang["name"]
-        if code == "en":
-            continue
-        values[code] = hf_translate(en_value, code, name)
+        # Normalize key
+        key = key_raw.upper().replace(" ", "_")
 
-    now = datetime.utcnow()
-    doc = {"key": key, "values": values, "created_at": now, "updated_at": now}
-    res = translations_col.insert_one(doc)
-    doc["_id"] = str(res.inserted_id)
+        # Check if key already exists
+        if translations_col.find_one({"key": key}):
+            return error_response("Translation key already exists")
 
-    push_event({"type": "translation_added", "key": key, "id": doc["_id"]})
-    return jsonify({"success": True, "translation": doc})
+        # Get target languages
+        if not target_languages:
+            langs = list(languages_col.find({"code": {"$ne": "en"}}, {"_id": 0}))
+            target_languages = [lang["code"] for lang in langs]
+
+        # Call translation service
+        values = {"en": en_value}
+        if target_languages:
+            result = call_translation_service(en_value, target_languages)
+            if result.get("success"):
+                values.update(result.get("translations", {}))
+            else:
+                logger.warning(f"Translation service error: {result.get('error')}")
+                # Use fallback format
+                for lang in target_languages:
+                    values[lang] = f"[{lang}] {en_value}"
+
+        # Insert document
+        now = datetime.utcnow()
+        doc = {
+            "key": key,
+            "values": values,
+            "created_at": now,
+            "updated_at": now
+        }
+        result = translations_col.insert_one(doc)
+        doc["_id"] = str(result.inserted_id)
+
+        push_event({
+            "type": "translation_added",
+            "key": key,
+            "id": doc["_id"]
+        })
+
+        logger.info(f"Translation added: {key}")
+        return success_response({"translation": serialize_doc(doc)})
+
+    except Exception as e:
+        logger.error(f"Error adding translation: {e}")
+        return error_response("Failed to add translation", 500)
 
 @app.route("/api/translations/<tid>", methods=["PUT"])
 def api_update_translation(tid):
-    body = request.get_json() or {}
-    values = body.get("values")
-    if not isinstance(values, dict):
-        return jsonify({"success": False, "error": "values dict required"}), 400
-    translations_col.update_one({"_id": ObjectId(tid)}, {"$set": {"values": values, "updated_at": datetime.utcnow()}})
-    push_event({"type": "translation_updated", "id": tid})
-    return jsonify({"success": True})
+    """Update translation values"""
+    try:
+        body = request.get_json() or {}
+        values = body.get("values")
+
+        if not isinstance(values, dict):
+            return error_response("Values must be a dictionary")
+
+        result = translations_col.update_one(
+            {"_id": ObjectId(tid)},
+            {
+                "$set": {
+                    "values": values,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        if result.matched_count == 0:
+            return error_response("Translation not found", 404)
+
+        push_event({"type": "translation_updated", "id": tid})
+        logger.info(f"Translation updated: {tid}")
+        return success_response()
+
+    except Exception as e:
+        logger.error(f"Error updating translation: {e}")
+        return error_response("Failed to update translation", 500)
 
 @app.route("/api/translations/<tid>", methods=["DELETE"])
 def api_delete_translation(tid):
-    translations_col.delete_one({"_id": ObjectId(tid)})
-    push_event({"type": "translation_deleted", "id": tid})
-    return jsonify({"success": True})
+    """Delete translation"""
+    try:
+        result = translations_col.delete_one({"_id": ObjectId(tid)})
+
+        if result.deleted_count == 0:
+            return error_response("Translation not found", 404)
+
+        push_event({"type": "translation_deleted", "id": tid})
+        logger.info(f"Translation deleted: {tid}")
+        return success_response()
+
+    except Exception as e:
+        logger.error(f"Error deleting translation: {e}")
+        return error_response("Failed to delete translation", 500)
 
 @app.route("/api/translations/<tid>/regenerate", methods=["POST"])
 def api_regenerate_translation(tid):
-    doc = translations_col.find_one({"_id": ObjectId(tid)})
-    if not doc:
-        return jsonify({"success": False, "error": "not found"}), 404
-    en = (doc.get("values") or {}).get("en", "")
-    new_vals = {"en": en}
-    for lang in list(languages_col.find({}, {"_id": 0})):
-        code = lang["code"]; name = lang["name"]
-        if code == "en": continue
-        new_vals[code] = hf_translate(en, code, name)
-    translations_col.update_one({"_id": doc["_id"]}, {"$set": {"values": new_vals, "updated_at": datetime.utcnow()}})
-    push_event({"type": "translation_regenerated", "id": str(doc["_id"])})
-    doc["values"] = new_vals; doc["_id"] = str(doc["_id"])
-    return jsonify({"success": True, "translation": doc})
+    """Regenerate all translations from English"""
+    try:
+        doc = translations_col.find_one({"_id": ObjectId(tid)})
+        if not doc:
+            return error_response("Translation not found", 404)
+
+        en_value = (doc.get("values") or {}).get("en", "")
+        if not en_value:
+            return error_response("No English value to translate from")
+
+        # Get target languages
+        langs = list(languages_col.find({"code": {"$ne": "en"}}, {"_id": 0}))
+        target_languages = [lang["code"] for lang in langs]
+
+        # Translate
+        new_values = {"en": en_value}
+        if target_languages:
+            result = call_translation_service(en_value, target_languages)
+            if result.get("success"):
+                new_values.update(result.get("translations", {}))
+            else:
+                for lang in target_languages:
+                    new_values[lang] = f"[{lang}] {en_value}"
+
+        # Update document
+        translations_col.update_one(
+            {"_id": doc["_id"]},
+            {
+                "$set": {
+                    "values": new_values,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        push_event({"type": "translation_regenerated", "id": tid})
+        logger.info(f"Translation regenerated: {tid}")
+
+        doc["values"] = new_values
+        return success_response({"translation": serialize_doc(doc)})
+
+    except Exception as e:
+        logger.error(f"Error regenerating translation: {e}")
+        return error_response("Failed to regenerate translation", 500)
 
 # ---------------------------
-# Export as JSON
+# Export
 # ---------------------------
 @app.route("/api/export/json", methods=["GET"])
 def api_export_json():
-    docs = [serialize_doc(d) for d in translations_col.find({})]
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    with open(tmp.name, "w", encoding="utf-8") as f:
-        json.dump(docs, f, ensure_ascii=False, indent=2, default=str)
-    return send_file(tmp.name, as_attachment=True, download_name="translations_export.json")
+    """Export all translations as JSON"""
+    try:
+        docs = [serialize_doc(d) for d in translations_col.find({})]
+        
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode='w', encoding='utf-8')
+        json.dump(docs, tmp, ensure_ascii=False, indent=2)
+        tmp.close()
+        
+        return send_file(
+            tmp.name,
+            as_attachment=True,
+            download_name=f"translations_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mimetype='application/json'
+        )
+    except Exception as e:
+        logger.error(f"Error exporting translations: {e}")
+        return error_response("Failed to export translations", 500)
 
 # ---------------------------
-# Health
+# Health Check
 # ---------------------------
 @app.route("/health")
 def health():
+    """Health check endpoint"""
     try:
+        # Check MongoDB
         client.admin.command("ping")
-        return jsonify({"ok": True})
+        
+        # Check translation service
+        try:
+            resp = requests.get(f"{TRANSLATION_SERVICE_URL}/health", timeout=2)
+            translation_service_status = resp.status_code == 200
+        except:
+            translation_service_status = False
+        
+        return jsonify({
+            "status": "healthy",
+            "mongodb": "connected",
+            "translation_service": "connected" if translation_service_status else "disconnected",
+            "timestamp": datetime.utcnow().isoformat()
+        })
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }), 500
 
 # ---------------------------
-# Run
+# Run Application
 # ---------------------------
 if __name__ == "__main__":
+    logger.info(f"Starting Translation Management Tool on port {PORT}")
+    logger.info(f"Debug mode: {DEBUG}")
     app.run(host="0.0.0.0", port=PORT, debug=DEBUG)

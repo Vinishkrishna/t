@@ -1,96 +1,215 @@
-<!-- templates/index.html -->
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Translation Management Tool</title>
+  <meta name="description" content="Professional translation management tool with automatic translation generation"/>
+  <title>Translation Management Tool - TMT</title>
   <link rel="stylesheet" href="/static/css/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌐</text></svg>">
 </head>
 <body>
   <div class="container">
+    <!-- Header -->
     <header class="top">
       <div>
-        <h1>TMT — Translation Management Tool</h1>
-        <p class="muted">Add keys, auto-translate (HuggingFace NLLB), edit & export. Fast & production-ready.</p>
+        <h1>🌐 TMT – Translation Management Tool</h1>
+        <p class="muted">
+          Add translation keys, auto-translate to multiple languages, and manage your i18n workflow efficiently.
+          <span style="color:#7c3aed">⚡ Powered by Google Translate API</span>
+        </p>
       </div>
       <div class="top-actions">
-        <button id="exportBtn" class="btn btn-ghost">Export JSON</button>
+        <button id="exportBtn" class="btn btn-ghost" title="Export all translations as JSON">
+          📥 Export JSON
+        </button>
       </div>
     </header>
 
+    <!-- Main Card -->
     <main class="card">
+      <!-- Tabs Navigation -->
       <nav class="tabs">
-        <button class="tab active" data-tab="add">Add</button>
-        <button class="tab" data-tab="manage">Manage</button>
-        <button class="tab" data-tab="languages">Languages</button>
+        <button class="tab active" data-tab="add" title="Add new translation">
+          ➕ Add Translation
+        </button>
+        <button class="tab" data-tab="manage" title="Manage existing translations">
+          📋 Manage Translations
+        </button>
+        <button class="tab" data-tab="languages" title="Configure languages">
+          🌍 Languages
+        </button>
       </nav>
 
+      <!-- Tab: Add Translation -->
       <section id="tab-add" class="tab-panel active">
         <div class="form-grid">
+          <!-- Translation Key -->
           <div>
-            <label>Key <small class="muted">e.g. HOME_TITLE</small></label>
-            <input id="translationKey" placeholder="HOME_TITLE">
+            <label for="translationKey">
+              Translation Key
+              <small class="muted">e.g., HOME_TITLE, BUTTON_SUBMIT</small>
+            </label>
+            <input 
+              id="translationKey" 
+              type="text"
+              placeholder="HOME_TITLE" 
+              autocomplete="off"
+              spellcheck="false">
           </div>
 
+          <!-- English Value -->
           <div>
-            <label>English value</label>
-            <textarea id="englishValue" placeholder="Welcome to Dashboard"></textarea>
+            <label for="englishValue">
+              English Value
+              <small class="muted">Source text for translation</small>
+            </label>
+            <textarea 
+              id="englishValue" 
+              placeholder="Welcome to our dashboard"
+              rows="4"></textarea>
           </div>
 
-          <div>
-            <label>Languages to auto-generate</label>
+          <!-- Language Selection -->
+          <div style="grid-column: 1 / -1;">
+            <label>
+              Target Languages
+              <small class="muted">Select languages to generate (leave empty for all)</small>
+            </label>
             <div class="dropdown-container">
-              <div id="langDropdown" class="dropdown-header">Select languages ▼</div>
+              <div id="langDropdown" class="dropdown-header">
+                🌍 Select target languages ▼
+              </div>
               <div id="langDropdownMenu" class="dropdown-menu"></div>
             </div>
-            <small class="muted">Select languages. If none selected, all non-English languages will be used.</small>
           </div>
 
+          <!-- Action Buttons -->
           <div class="actions">
-            <button id="generateBtn" class="btn btn-primary">Generate & Save</button>
-            <button id="clearBtn" class="btn btn-secondary">Clear</button>
+            <button id="generateBtn" class="btn btn-primary" title="Generate translations and save">
+              ✨ Generate & Save
+            </button>
+            <button id="clearBtn" class="btn btn-secondary" title="Clear form">
+              🗑️ Clear Form
+            </button>
           </div>
         </div>
 
+        <!-- Generated Translation Preview -->
         <div id="generatedArea" class="mt-16"></div>
       </section>
 
+      <!-- Tab: Manage Translations -->
       <section id="tab-manage" class="tab-panel">
+        <!-- Toolbar -->
         <div class="toolbar">
-          <input id="searchInput" placeholder="Search by key or text">
-          <div>
-            <select id="sortBy"><option value="key">Key</option><option value="created_at">Created</option></select>
-            <select id="orderBy"><option value="asc">Asc</option><option value="desc">Desc</option></select>
-            <button id="searchBtn" class="btn">Search</button>
+          <input 
+            id="searchInput" 
+            type="search"
+            placeholder="🔍 Search by key or value... (Ctrl+K)"
+            autocomplete="off">
+          <div style="display:flex; gap:8px; align-items:center">
+            <select id="sortBy" title="Sort by">
+              <option value="key">Sort: Key</option>
+              <option value="created_at">Sort: Created</option>
+              <option value="updated_at">Sort: Updated</option>
+            </select>
+            <select id="orderBy" title="Order">
+              <option value="asc">↑ Ascending</option>
+              <option value="desc">↓ Descending</option>
+            </select>
+            <button id="searchBtn" class="btn btn-primary" title="Search translations">
+              🔍 Search
+            </button>
           </div>
         </div>
 
+        <!-- Translations List -->
         <div id="translationsList" class="list mt-12"></div>
-        <div id="pagination" class="mt-8"></div>
+
+        <!-- Pagination -->
+        <div id="pagination" class="mt-8" style="display:flex; gap:6px; flex-wrap:wrap; justify-content:center"></div>
       </section>
 
+      <!-- Tab: Languages -->
       <section id="tab-languages" class="tab-panel">
-        <div class="lang-grid">
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:24px">
+          <!-- Existing Languages -->
           <div>
-            <label>Existing languages</label>
+            <label style="font-weight:700; margin-bottom:12px; display:block">
+              🌍 Configured Languages
+            </label>
             <div id="languagesList" class="language-list"></div>
           </div>
+
+          <!-- Add New Language -->
           <div>
-            <label>Add a language</label>
-            <input id="languageCode" placeholder="e.g. de or pt">
-            <input id="languageName" placeholder="Language name e.g. German">
-            <button id="addLanguageBtn" class="btn btn-primary">Add Language</button>
+            <label style="font-weight:700; margin-bottom:12px; display:block">
+              ➕ Add New Language
+            </label>
+            
+            <div style="margin-bottom:16px">
+              <label for="standardLangSelect" style="font-size:13px; color:#64748b; margin-bottom:6px; display:block">
+                Quick Select (Standard Languages)
+              </label>
+              <select id="standardLangSelect" style="width:100%">
+                <option value="">-- Select a standard language --</option>
+              </select>
+            </div>
+
+            <div style="margin-bottom:12px">
+              <label for="languageCode" style="font-size:13px; color:#64748b; margin-bottom:6px; display:block">
+                Language Code
+              </label>
+              <input 
+                id="languageCode" 
+                type="text"
+                placeholder="e.g., de, pt, ja, zh-CN"
+                autocomplete="off"
+                spellcheck="false"
+                style="text-transform:lowercase">
+              <small class="muted" style="display:block; margin-top:4px">
+                ISO 639-1 code (e.g., en, es, fr, de)
+              </small>
+            </div>
+
+            <div style="margin-bottom:16px">
+              <label for="languageName" style="font-size:13px; color:#64748b; margin-bottom:6px; display:block">
+                Language Name
+              </label>
+              <input 
+                id="languageName" 
+                type="text"
+                placeholder="e.g., German, Portuguese, Japanese"
+                autocomplete="off">
+            </div>
+
+            <button id="addLanguageBtn" class="btn btn-primary" style="width:100%" title="Add new language">
+              ✅ Add Language
+            </button>
+
+            <div style="margin-top:16px; padding:12px; background:#f0f9ff; border-radius:8px; font-size:13px; color:#0369a1">
+              <strong>💡 Note:</strong> Adding a language will automatically translate all existing keys to the new language using Google Translate.
+            </div>
           </div>
         </div>
       </section>
     </main>
 
-    <footer class="foot muted">Built with Flask • HuggingFace • MongoDB · TMT</footer>
+    <!-- Footer -->
+    <footer class="foot muted">
+      Built with ❤️ using Flask • Google Translate API • MongoDB
+      <span style="margin:0 8px">•</span>
+      <a href="/health" target="_blank" style="color:#7c3aed; text-decoration:none">System Health</a>
+      <span style="margin:0 8px">•</span>
+      Keyboard shortcuts: <kbd>Ctrl+K</kbd> Search, <kbd>Ctrl+N</kbd> New
+    </footer>
   </div>
 
+  <!-- Toast Notification -->
   <div id="toast" class="toast"></div>
 
+  <!-- Scripts -->
   <script src="/static/js/main.js"></script>
 </body>
 </html>
